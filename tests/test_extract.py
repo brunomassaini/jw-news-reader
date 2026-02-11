@@ -58,6 +58,99 @@ def test_extract_preserves_order_and_captions():
     ]
 
 
+def test_article_header_image_kept():
+    html = """
+    <html>
+      <body>
+        <article>
+          <header>
+            <figure>
+              <img src="/images/hero.jpg" alt="Hero">
+            </figure>
+          </header>
+          <p>Body content.</p>
+        </article>
+      </body>
+    </html>
+    """
+    result = extract_from_html(html, "https://www.jw.org/en/")
+    markdown = result["markdown"]
+
+    assert "Body content." in markdown
+    assert "![Hero](https://www.jw.org/images/hero.jpg)" in markdown
+    assert result["images"] == [
+        {"url": "https://www.jw.org/images/hero.jpg", "alt": "Hero", "caption": None},
+    ]
+
+
+def test_data_largest_image_resolution():
+    html = """
+    <html>
+      <body>
+        <article>
+          <img data-largest="/images/hero.jpg" alt="Hero">
+        </article>
+      </body>
+    </html>
+    """
+    result = extract_from_html(html, "https://www.jw.org/en/")
+    assert "![Hero](https://www.jw.org/images/hero.jpg)" in result["markdown"]
+    assert result["images"] == [
+        {"url": "https://www.jw.org/images/hero.jpg", "alt": "Hero", "caption": None},
+    ]
+
+
+def test_fallback_image_from_cms_url():
+    html = """
+    <html>
+      <head><title>Sample Title</title></head>
+      <body>
+        <main>
+          <p>Body content.</p>
+        </main>
+        <div class="context">
+          https://cms-imgp.jw-cdn.org/img/p/504000002/univ/art/504000002_univ_sqr_xl.jpg
+        </div>
+      </body>
+    </html>
+    """
+    result = extract_from_html(html, "https://www.jw.org/en/")
+    assert "![Sample Title](https://cms-imgp.jw-cdn.org/img/p/504000002/univ/art/504000002_univ_sqr_xl.jpg)" in result["markdown"]
+    assert result["images"] == [
+        {
+            "url": "https://cms-imgp.jw-cdn.org/img/p/504000002/univ/art/504000002_univ_sqr_xl.jpg",
+            "alt": "Sample Title",
+            "caption": None,
+        },
+    ]
+
+
+def test_fallback_image_from_image_link():
+    html = """
+    <html>
+      <body>
+        <main>
+          <p>Body content.</p>
+        </main>
+        <div class="context">
+          <a href="https://cms-imgp.jw-cdn.org/img/p/123/univ/art/123_univ_sqr_xl.jpg">
+            Image: Hero image alt text
+          </a>
+        </div>
+      </body>
+    </html>
+    """
+    result = extract_from_html(html, "https://www.jw.org/en/")
+    assert "![Hero image alt text](https://cms-imgp.jw-cdn.org/img/p/123/univ/art/123_univ_sqr_xl.jpg)" in result["markdown"]
+    assert result["images"] == [
+        {
+            "url": "https://cms-imgp.jw-cdn.org/img/p/123/univ/art/123_univ_sqr_xl.jpg",
+            "alt": "Hero image alt text",
+            "caption": None,
+        },
+    ]
+
+
 def test_relative_image_resolution():
     html = """
     <html><body><main><img src="/media/pic.jpg" alt="Pic"></main></body></html>

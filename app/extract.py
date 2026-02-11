@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Optional, Tuple
@@ -21,6 +22,10 @@ METADATA_CLASS_RE = re.compile(
     re.IGNORECASE,
 )
 ISSUE_RE = re.compile(r"\bwp\d{2}\b", re.IGNORECASE)
+CMS_IMAGE_RE = re.compile(r"https?://cms-imgp\.jw-cdn\.org/img/p/[^\s\"'<>]+", re.IGNORECASE)
+AKAMAI_IMAGE_RE = re.compile(
+    r"https?://assetsnffrgf-a\.akamaihd\.net/assets/[^\s\"'<>]+", re.IGNORECASE
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -79,13 +84,17 @@ def _remove_unwanted_tags(soup: BeautifulSoup) -> None:
         "style",
         "noscript",
         "nav",
-        "header",
         "footer",
         "aside",
         "svg",
         "form",
         "button",
     ]):
+        tag.decompose()
+
+    for tag in soup.find_all("header"):
+        if tag.find_parent("article") or tag.find_parent("main"):
+            continue
         tag.decompose()
 
 
@@ -146,6 +155,8 @@ def _strip_player_controls(container: Tag) -> None:
         class_text = " ".join(tag.get("class", []))
         id_text = tag.get("id", "")
         if not (PLAYER_CLASS_RE.search(class_text) or PLAYER_CLASS_RE.search(id_text)):
+            continue
+        if tag.find("img") is not None or tag.find("picture") is not None:
             continue
         text_len = len(tag.get_text(" ", strip=True))
         if text_len <= 20:
@@ -272,8 +283,161 @@ def _best_src_from_srcset(srcset: str) -> Optional[str]:
     return candidates[-1][2]
 
 
+def _score_image_url(url: str) -> int:
+    match = re.search(r"_(xs|s|m|l|xl)(?:\b|\.|_)", url, re.IGNORECASE)
+    if not match:
+        return 0
+    size = match.group(1).lower()
+    return {"xs": 1, "s": 2, "m": 3, "l": 4, "xl": 5}.get(size, 0)
+
+
+def _pick_best_image_url(urls: list[str]) -> Optional[str]:
+    if not urls:
+        return None
+    scored = [(idx, _score_image_url(url), url) for idx, url in enumerate(urls)]
+    scored.sort(key=lambda item: (item[1], -item[0]))
+    return scored[-1][2]
+
+
+def _extract_meta_image(soup: BeautifulSoup) -> Optional[str]:
+    keys = [
+        ("property", "og:image"),
+        ("property", "og:image:secure_url"),
+        ("name", "twitter:image"),
+        ("name", "twitter:image:src"),
+        ("itemprop", "image"),
+    ]
+    for attr, key in keys:
+        tag = soup.find("meta", attrs={attr: key})
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    return None
+
+
+def _extract_jsonld_image(soup: BeautifulSoup) -> Optional[str]:
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        if not script.string:
+            continue
+        try:
+            payload = json.loads(script.string)
+        except json.JSONDecodeError:
+            continue
+        url = _extract_jsonld_image_value(payload)
+        if url:
+            return url
+    return None
+
+
+def _extract_jsonld_image_value(payload: object) -> Optional[str]:
+    if isinstance(payload, dict):
+        for key in ("image", "thumbnailUrl"):
+            if key in payload:
+                value = payload[key]
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str):
+                            return item
+                        if isinstance(item, dict) and "url" in item:
+                            url = item.get("url")
+                            if isinstance(url, str):
+                                return url
+                if isinstance(value, dict) and "url" in value:
+                    url = value.get("url")
+                    if isinstance(url, str):
+                        return url
+        for nested in payload.values():
+            url = _extract_jsonld_image_value(nested)
+            if url:
+                return url
+    elif isinstance(payload, list):
+        for item in payload:
+            url = _extract_jsonld_image_value(item)
+            if url:
+                return url
+    return None
+
+
+def _extract_image_link(soup: BeautifulSoup) -> tuple[Optional[str], Optional[str]]:
+    for anchor in soup.find_all("a"):
+        text = anchor.get_text(" ", strip=True)
+        if not text:
+            continue
+        if text.startswith("Image:"):
+            href = anchor.get("href")
+            if href:
+                alt = text.split("Image:", 1)[1].strip() or None
+                return href, alt
+    return None, None
+
+
+def _extract_fallback_image(
+    html: str,
+    soup: BeautifulSoup,
+    base_url: str,
+) -> Optional[dict]:
+    meta_image = _extract_meta_image(soup)
+    if meta_image:
+        return {"url": urljoin(base_url, meta_image), "alt": None, "caption": None}
+
+    jsonld_image = _extract_jsonld_image(soup)
+    if jsonld_image:
+        return {"url": urljoin(base_url, jsonld_image), "alt": None, "caption": None}
+
+    link_url, link_alt = _extract_image_link(soup)
+    if link_url:
+        return {"url": urljoin(base_url, link_url), "alt": link_alt, "caption": None}
+
+    cms_urls = CMS_IMAGE_RE.findall(html)
+    if cms_urls:
+        best = _pick_best_image_url(cms_urls)
+        if best:
+            return {"url": best, "alt": None, "caption": None}
+
+    akamai_urls = AKAMAI_IMAGE_RE.findall(html)
+    if akamai_urls:
+        best = _pick_best_image_url(akamai_urls)
+        if best:
+            return {"url": best, "alt": None, "caption": None}
+
+    return None
+
+
+def _insert_fallback_image(markdown: str, image: dict) -> str:
+    alt = image.get("alt") or ""
+    url = image["url"]
+    image_md = f"![{alt}]({url})"
+    if not markdown.strip():
+        return image_md
+
+    lines = markdown.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip():
+            if line.startswith("# "):
+                head = "\n".join(lines[: idx + 1])
+                tail = "\n".join(lines[idx + 1 :]).strip()
+                if tail:
+                    return f"{head}\n\n{image_md}\n\n{tail}"
+                return f"{head}\n\n{image_md}"
+            return f"{image_md}\n\n{markdown}"
+    return f"{image_md}\n\n{markdown}"
+
+
 def _normalize_img_tag(img: Tag, base_url: str) -> Optional[str]:
     src = img.get("data-src") or img.get("src")
+    if not src:
+        for attr in [
+            "data-original",
+            "data-largest",
+            "data-large",
+            "data-medium",
+            "data-small",
+            "data-smallest",
+        ]:
+            src = img.get(attr)
+            if src:
+                break
     if not src:
         srcset = img.get("srcset") or img.get("data-srcset")
         if srcset:
@@ -284,7 +448,17 @@ def _normalize_img_tag(img: Tag, base_url: str) -> Optional[str]:
 
     abs_src = urljoin(base_url, src)
     img["src"] = abs_src
-    for attr in ["data-src", "data-srcset", "data-original", "srcset"]:
+    for attr in [
+        "data-src",
+        "data-srcset",
+        "data-original",
+        "data-largest",
+        "data-large",
+        "data-medium",
+        "data-small",
+        "data-smallest",
+        "srcset",
+    ]:
         if attr in img.attrs:
             del img.attrs[attr]
     return abs_src
@@ -384,6 +558,7 @@ def _html_to_markdown(container: Tag) -> str:
 
 def extract_from_html(html: str, base_url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
+    fallback_image = _extract_fallback_image(html, soup, base_url)
     _remove_unwanted_tags(soup)
 
     container = _select_container(soup)
@@ -404,6 +579,11 @@ def extract_from_html(html: str, base_url: str) -> dict:
     images = _collect_images(container)
     markdown = _html_to_markdown(container)
     markdown = _ensure_markdown_title(markdown, title)
+    if not images and fallback_image:
+        if not fallback_image.get("alt"):
+            fallback_image["alt"] = title
+        images = [fallback_image]
+        markdown = _insert_fallback_image(markdown, fallback_image)
 
     return {
         "markdown": markdown,
